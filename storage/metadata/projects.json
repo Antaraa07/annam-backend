@@ -1,0 +1,20 @@
+[
+  {
+    "project_id": "dd9eeea4-395e-4aa7-ac65-c578d3267a3e",
+    "name": "Test",
+    "description": "Desc",
+    "owner": "antara",
+    "created_at": "2026-06-30T06:20:32Z",
+    "label_classes": []
+  },
+  {
+    "project_id": "a059e45e-6d9d-4a6b-8357-0a16bf1dcd74",
+    "name": "wheat",
+    "description": "wheat crop study",
+    "owner": "antara",
+    "created_at": "2026-06-30T06:34:50Z",
+    "label_classes": [
+      "class1"
+    ]
+  }
+]
