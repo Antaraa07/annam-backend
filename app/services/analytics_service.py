@@ -1,21 +1,109 @@
-import json
-import pandas as pd
-from pathlib import Path
-
-
-METADATA_DIR = Path("storage/metadata")
+from app.db import run_df, run_one, run_raw
 
 
 def load_datasets():
+    """
+    Drop-in replacement for the old JSON-scanning version.
+    Same return shape (a DataFrame of all datasets), but backed by
+    a single indexed SQL query instead of opening every file on disk.
+    """
+    return run_df("SELECT * FROM datasets ORDER BY uploaded_at DESC")
 
-    records = []
 
-    for file in METADATA_DIR.glob("*.json"):
+def get_summary():
+    """Powers /analytics/summary"""
+    row = run_one(
+        """
+        SELECT
+            count(*)                          AS total_datasets,
+            count(DISTINCT owner)             AS total_owners,
+            count(DISTINCT department)        AS total_departments,
+            max(uploaded_at)                  AS last_upload_at
+        FROM datasets
+        """
+    )
 
-        with open(file, "r") as f:
-            records.append(json.load(f))
+    return {
+        "datasets": row[0],
+        "owners": row[1],
+        "departments": row[2],
+        # No file-size column exists in the schema yet.
+        "storage": "Pending",
+        "last_upload_at": row[3].isoformat() if row[3] else None,
+    }
 
-    if not records:
-        return pd.DataFrame()
 
-    return pd.DataFrame(records)
+def get_by_owner():
+    """Powers /analytics/owners"""
+    rows = run_raw(
+        """
+        SELECT owner, count(*) AS dataset_count
+        FROM datasets
+        WHERE owner IS NOT NULL
+        GROUP BY owner
+        ORDER BY dataset_count DESC
+        """
+    )
+    return [{"owner": r[0], "dataset_count": r[1]} for r in rows]
+
+
+def get_by_department():
+    """Powers /analytics/departments"""
+    rows = run_raw(
+        """
+        SELECT department, count(*) AS dataset_count
+        FROM datasets
+        WHERE department IS NOT NULL
+        GROUP BY department
+        ORDER BY dataset_count DESC
+        """
+    )
+    return [{"department": r[0], "dataset_count": r[1]} for r in rows]
+
+
+def get_recent(limit: int = 10):
+    """Powers /analytics/recent and /analytics/recent-uploads"""
+    rows = run_raw(
+        """
+        SELECT image_id, filename, dataset_name, owner, department, version, uploaded_at
+        FROM datasets
+        ORDER BY uploaded_at DESC
+        LIMIT ?
+        """,
+        [limit],
+    )
+    return [
+        {
+            "image_id": r[0],
+            "filename": r[1],
+            "dataset_name": r[2] or r[1] or "Untitled",
+            "owner": r[3] or "Unknown",
+            "department": r[4] or "Unassigned",
+            "version": r[5] or "v1",
+            "uploaded_at": r[6].isoformat() if r[6] else None,
+        }
+        for r in rows
+    ]
+
+
+def get_active_users(limit: int = 10):
+    """Powers /analytics/active-users — owners ranked by upload count."""
+    rows = run_raw(
+        """
+        SELECT owner, count(*) AS upload_count, max(uploaded_at) AS last_upload_at
+        FROM datasets
+        WHERE owner IS NOT NULL
+        GROUP BY owner
+        ORDER BY upload_count DESC
+        LIMIT ?
+        """,
+        [limit],
+    )
+    return [
+        {
+            "owner": r[0],
+            "upload_count": r[1],
+            "last_upload_at": r[2].isoformat() if r[2] else None,
+        }
+        for r in rows
+    ]

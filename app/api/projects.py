@@ -128,6 +128,21 @@ def get_project(project_id: str, username: str):
     raise HTTPException(status_code=404, detail="Project not found")
 
 
+@router.delete("/projects/{project_id}")
+def delete_project(project_id: str, username: str):
+    user = get_user(username)
+    _require_admin(user)
+
+    projects = _load_projects()
+    new_projects = [p for p in projects if not (p.get("project_id") == project_id and p.get("owner") == username)]
+
+    if len(new_projects) == len(projects):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    _save_projects(new_projects)
+    return {"message": "Project deleted", "project_id": project_id}
+
+
 @router.get("/projects/{project_id}/stats")
 def project_stats(project_id: str, username: str):
     user = get_user(username)
