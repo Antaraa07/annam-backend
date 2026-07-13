@@ -18,6 +18,8 @@ from app.api.sql import router as sql_router
 from app.api.image import router as image_router
 from app.api.activity import router as activity_router
 from app.api.projects import router as projects_router
+from app.api.auth import router as auth_router
+
 
 app = FastAPI(
 
@@ -70,6 +72,8 @@ app.include_router(sql_router)
 app.include_router(image_router)
 app.include_router(activity_router)
 app.include_router(projects_router, prefix="")
+app.include_router(auth_router)
+
 
 @app.get("/")
 def home():

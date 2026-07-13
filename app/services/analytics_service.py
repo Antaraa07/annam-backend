@@ -10,17 +10,21 @@ def load_datasets():
     return run_df("SELECT * FROM datasets ORDER BY uploaded_at DESC")
 
 
-def get_summary():
+def get_summary(username: str | None = None):
     """Powers /analytics/summary"""
+    where = "WHERE owner = ?" if username else ""
+    params = [username] if username else []
     row = run_one(
-        """
+        f"""
         SELECT
             count(*)                          AS total_datasets,
             count(DISTINCT owner)             AS total_owners,
             count(DISTINCT department)        AS total_departments,
             max(uploaded_at)                  AS last_upload_at
         FROM datasets
-        """
+        {where}
+        """,
+        params,
     )
 
     return {
@@ -47,30 +51,36 @@ def get_by_owner():
     return [{"owner": r[0], "dataset_count": r[1]} for r in rows]
 
 
-def get_by_department():
+def get_by_department(username: str | None = None):
     """Powers /analytics/departments"""
+    where = "AND owner = ?" if username else ""
+    params = [username] if username else []
     rows = run_raw(
-        """
+        f"""
         SELECT department, count(*) AS dataset_count
         FROM datasets
-        WHERE department IS NOT NULL
+        WHERE department IS NOT NULL {where}
         GROUP BY department
         ORDER BY dataset_count DESC
-        """
+        """,
+        params,
     )
     return [{"department": r[0], "dataset_count": r[1]} for r in rows]
 
 
-def get_recent(limit: int = 10):
+def get_recent(limit: int = 10, username: str | None = None):
     """Powers /analytics/recent and /analytics/recent-uploads"""
+    where = "AND owner = ?" if username else ""
+    params = [username, limit] if username else [limit]
     rows = run_raw(
-        """
+        f"""
         SELECT image_id, filename, dataset_name, owner, department, version, uploaded_at
         FROM datasets
+        WHERE 1=1 {where}
         ORDER BY uploaded_at DESC
         LIMIT ?
         """,
-        [limit],
+        params,
     )
     return [
         {

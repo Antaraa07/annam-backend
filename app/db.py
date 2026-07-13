@@ -47,6 +47,8 @@ def _init_schema(conn):
             owner         VARCHAR,
             department    VARCHAR,
             version       VARCHAR,
+            project_id    VARCHAR,
+            label         VARCHAR,
             uploaded_at   TIMESTAMP DEFAULT current_timestamp,
             metadata_json JSON
         )
@@ -56,6 +58,8 @@ def _init_schema(conn):
     for col_def in [
         "dataset_name VARCHAR",
         "version VARCHAR",
+        "project_id VARCHAR",
+        "label VARCHAR",
     ]:
         try:
             conn.execute(f"ALTER TABLE datasets ADD COLUMN {col_def}")
@@ -65,6 +69,7 @@ def _init_schema(conn):
     # Helpful for the analytics group-by queries
     conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_owner ON datasets(owner)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_department ON datasets(department)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_project_id ON datasets(project_id)")
 
 
 def run(query: str, params: list | None = None):
