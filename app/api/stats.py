@@ -20,7 +20,7 @@ def get_stats(username: str):
             detail="User not found"
         )
 
-    if user["role"] not in ["admin", "researcher"]:
+    if user["role"] not in ["superadmin", "admin", "researcher"]:
         raise HTTPException(
             status_code=403,
             detail="Permission denied"

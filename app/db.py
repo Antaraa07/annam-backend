@@ -54,6 +54,20 @@ def _init_schema(conn):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_updates (
+            update_id   VARCHAR PRIMARY KEY,
+            username    VARCHAR NOT NULL,
+            work_date   DATE NOT NULL,
+            project     VARCHAR,
+            work_done   VARCHAR NOT NULL,
+            status      VARCHAR NOT NULL DEFAULT 'in_progress',
+            next_steps  VARCHAR,
+            created_at  TIMESTAMP DEFAULT current_timestamp
+        )
+        """
+    )
     # Safe to re-run: adds columns if migrating an older DB that predates them.
     for col_def in [
         "dataset_name VARCHAR",

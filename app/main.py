@@ -1,5 +1,7 @@
 import shutil
+import json
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,10 +21,9 @@ from app.api.image import router as image_router
 from app.api.activity import router as activity_router
 from app.api.projects import router as projects_router
 from app.api.auth import router as auth_router
-
+from app.api.daily_updates import router as daily_updates_router
 
 app = FastAPI(
-
     title="ANNAM Storage Platform",
     version="1.0"
 )
@@ -31,7 +32,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://annam-frontend.vercel.app",  # replace with your actual Vercel URL
+        "https://annam-frontend.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -58,6 +59,28 @@ async def seed_storage():
             for item in src_dir.iterdir():
                 shutil.copy2(item, dst_dir / item.name)
 
+    # Clean up orphaned datasets for projects deleted in the past
+    try:
+        from app.db import run, run_execute
+        projects_file = base.parent / "storage" / "metadata" / "projects.json"
+        valid_ids = set()
+        if projects_file.exists():
+            with open(projects_file, "r") as f:
+                projects_list = json.load(f)
+                if isinstance(projects_list, list):
+                    valid_ids = {p.get("project_id") for p in projects_list if p.get("project_id")}
+
+        # Query distinct project_ids in db
+        db_project_ids = run("SELECT DISTINCT project_id FROM datasets WHERE project_id IS NOT NULL")
+        for row in db_project_ids:
+            pid = row.get("project_id")
+            if pid and pid not in valid_ids:
+                print(f"Cleaning up orphaned datasets for deleted project ID: {pid}")
+                run_execute("DELETE FROM datasets WHERE project_id = ?", [pid])
+    except Exception as e:
+        print(f"Orphan cleanup error: {e}")
+
+
 app.include_router(datasets_router)
 app.include_router(download_router)
 app.include_router(upload_router)
@@ -73,6 +96,7 @@ app.include_router(image_router)
 app.include_router(activity_router)
 app.include_router(projects_router, prefix="")
 app.include_router(auth_router)
+app.include_router(daily_updates_router)
 
 
 @app.get("/")

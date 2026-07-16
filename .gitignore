@@ -1,6 +1,10 @@
-__pycache__/ 
-*.pyc 
-.env 
-venv/ 
-.vscode/ 
+storage/uploads/
+storage/annam.duckdb
+storage/annam.duckdb.wal
+storage/metadata/
+storage/users/
 
+__pycache__/
+*.pyc
+.env
+venv/

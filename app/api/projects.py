@@ -32,7 +32,12 @@ def _load_projects() -> List[Dict[str, Any]]:
     try:
         with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            for p in data:
+                if "status" not in p:
+                    p["status"] = "not started"
+            return data
+        return []
     except Exception:
         return []
 
@@ -46,7 +51,7 @@ def _save_projects(projects: List[Dict[str, Any]]) -> None:
 def _require_admin(user: Optional[Dict[str, Any]]):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.get("role") != "admin":
+    if user.get("role") not in {"admin", "superadmin"}:
         raise HTTPException(status_code=403, detail="Permission denied")
 
 
@@ -58,6 +63,7 @@ class ProjectOut(BaseModel):
     created_at: str
     label_classes: List[str] = []
     assigned_users: List[str] = []
+    status: str = "not started"
 
 
 @router.post("/projects", response_model=ProjectOut)
@@ -90,11 +96,30 @@ def create_project(
         "created_at": _now_iso(),
         "label_classes": parsed_label_classes,
         "assigned_users": [],
+        "status": "not started",
     }
 
     projects.append(project)
     _save_projects(projects)
     return project
+
+
+@router.patch("/projects/{project_id}/status")
+def update_project_status(project_id: str, status: str, username: str):
+    user = get_user(username)
+    _require_admin(user)
+
+    if status not in {"not started", "ongoing", "completed"}:
+        raise HTTPException(status_code=400, detail="Invalid status. Must be 'not started', 'ongoing', or 'completed'.")
+
+    projects = _load_projects()
+    for p in projects:
+        if p.get("project_id") == project_id:
+            p["status"] = status
+            _save_projects(projects)
+            return p
+
+    raise HTTPException(status_code=404, detail="Project not found")
 
 
 @router.get("/my-projects")
@@ -113,6 +138,8 @@ def list_projects(username: str):
     _require_admin(user)
 
     projects = _load_projects()
+    if user.get("role") == "superadmin":
+        return projects
     return [p for p in projects if p.get("owner") == username]
 
 
@@ -123,7 +150,7 @@ def get_project(project_id: str, username: str):
 
     projects = _load_projects()
     for p in projects:
-        if p.get("project_id") == project_id and p.get("owner") == username:
+        if p.get("project_id") == project_id and (user.get("role") == "superadmin" or p.get("owner") == username):
             return p
 
     raise HTTPException(status_code=404, detail="Project not found")
@@ -135,12 +162,26 @@ def delete_project(project_id: str, username: str):
     _require_admin(user)
 
     projects = _load_projects()
-    new_projects = [p for p in projects if not (p.get("project_id") == project_id and p.get("owner") == username)]
+    new_projects = [p for p in projects if not (p.get("project_id") == project_id and (user.get("role") == "superadmin" or p.get("owner") == username))]
 
     if len(new_projects) == len(projects):
         raise HTTPException(status_code=404, detail="Project not found")
 
     _save_projects(new_projects)
+
+    # Clean up associated datasets from DuckDB
+    from app.db import run_execute
+    run_execute("DELETE FROM datasets WHERE project_id = ?", [project_id])
+
+    # Clean up local project files
+    import shutil
+    project_dir = BASE_DIR / "storage" / "uploads" / "projects" / project_id
+    if project_dir.exists():
+        try:
+            shutil.rmtree(project_dir)
+        except Exception:
+            pass
+
     return {"message": "Project deleted", "project_id": project_id}
 
 
@@ -155,7 +196,7 @@ def assign_user(project_id: str, username: str, assign_username: str):
 
     projects = _load_projects()
     for p in projects:
-        if p.get("project_id") == project_id and p.get("owner") == username:
+        if p.get("project_id") == project_id and (user.get("role") == "superadmin" or p.get("owner") == username):
             assigned = p.setdefault("assigned_users", [])
             if assign_username not in assigned:
                 assigned.append(assign_username)
@@ -172,7 +213,7 @@ def unassign_user(project_id: str, username: str, assign_username: str):
 
     projects = _load_projects()
     for p in projects:
-        if p.get("project_id") == project_id and p.get("owner") == username:
+        if p.get("project_id") == project_id and (user.get("role") == "superadmin" or p.get("owner") == username):
             assigned = p.get("assigned_users", [])
             if assign_username not in assigned:
                 raise HTTPException(status_code=404, detail="User not assigned to this project")
@@ -194,7 +235,7 @@ def project_stats(project_id: str, username: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    is_admin = user.get("role") == "admin" and project.get("owner") == username
+    is_admin = user.get("role") == "superadmin" or (user.get("role") == "admin" and project.get("owner") == username)
     is_assigned = username in project.get("assigned_users", [])
     if not is_admin and not is_assigned:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -231,40 +272,61 @@ async def bulk_upload(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    is_admin = user.get("role") == "admin" and project.get("owner") == username
+    is_admin = user.get("role") == "superadmin" or (user.get("role") == "admin" and project.get("owner") == username)
     is_assigned = username in project.get("assigned_users", [])
     if not is_admin and not is_assigned:
         raise HTTPException(status_code=403, detail="Not authorized to upload to this project")
 
-    # Parse CSV annotations if provided: filename -> row dict
-    csv_annotations: dict = {}
-    if csv_file:
-        import csv, io as _io
-        content = (await csv_file.read()).decode("utf-8", errors="ignore")
-        reader = csv.DictReader(_io.StringIO(content))
-        for row in reader:
-            fname = row.get("filename") or row.get("file") or ""
-            if fname:
-                csv_annotations[fname.strip()] = dict(row)
+    import shutil
+    from app.services.s3_service import is_s3_enabled, upload_file_to_s3, get_bucket_name
+    from app.db import run_execute
 
-    from app.services.upload_service import save_file
+    project_dir = BASE_DIR / "storage" / "uploads" / "projects" / project_id
+    project_dir.mkdir(parents=True, exist_ok=True)
 
     uploaded_filenames: List[str] = []
     timestamp = _now_iso()
 
     for f in files:
-        ann = csv_annotations.get(f.filename or "", {})
-        metadata = {
-            "dataset_name": f"{project.get('name', '')} - {timestamp}",
-            "owner": username,
-            "lab/dept": ann.get("department") or ann.get("lab_dept") or "General",
-            "version": ann.get("version") or "1.0",
-            "description": ann.get("description") or (f"Bulk uploaded with label: {label}" if label else "Bulk uploaded"),
-            "project_id": project_id,
-            "label": ann.get("label") or label,
-        }
-        res = save_file(f, metadata)
-        uploaded_filenames.append(res["filename"])
+        safe_filename = Path(f.filename).name
+        file_path = project_dir / safe_filename
+
+        # Save locally first
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(f.file, buffer)
+
+        stored_path = str(file_path)
+        if is_s3_enabled():
+            s3_key = f"uploads/projects/{project_id}/{safe_filename}"
+            if upload_file_to_s3(file_path, s3_key):
+                stored_path = f"s3://{get_bucket_name()}/{s3_key}"
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+
+        image_id = str(uuid.uuid4())
+
+        run_execute(
+            """
+            INSERT INTO datasets
+                (image_id, filename, path, dataset_name, owner, department, version, project_id, label, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                image_id,
+                safe_filename,
+                stored_path,
+                f"{project.get('name', 'Project')} - {timestamp}",
+                username,
+                "General",
+                "1.0",
+                project_id,
+                None,
+                "{}",
+            ]
+        )
+        uploaded_filenames.append(safe_filename)
 
     return {
         "uploaded_count": len(uploaded_filenames),
@@ -283,7 +345,7 @@ def get_project_images(project_id: str, username: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    is_admin = user.get("role") == "admin" and project.get("owner") == username
+    is_admin = user.get("role") == "superadmin" or (user.get("role") == "admin" and project.get("owner") == username)
     is_assigned = username in project.get("assigned_users", [])
     if not is_admin and not is_assigned:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -298,12 +360,23 @@ def get_project_images(project_id: str, username: str):
 @router.get("/projects/{project_id}/bulk-download")
 def bulk_download(project_id: str, username: str):
     user = get_user(username)
-    _require_admin(user)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    projects = _load_projects()
+    project = next((p for p in projects if p.get("project_id") == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    is_admin = user.get("role") == "superadmin" or (user.get("role") == "admin" and project.get("owner") == username)
+    is_assigned = username in project.get("assigned_users", [])
+    if not is_admin and not is_assigned:
+        raise HTTPException(status_code=403, detail="Not authorized to download this project data")
 
     from app.db import run
     rows = run("SELECT path, filename FROM datasets WHERE project_id = ?", [project_id])
     if not rows:
-        raise HTTPException(status_code=404, detail="No images found for this project")
+        raise HTTPException(status_code=404, detail="No files found for this project")
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -331,3 +404,43 @@ def bulk_download(project_id: str, username: str):
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=project_{project_id}.zip"}
     )
+
+
+@router.post("/projects/clean-orphans")
+def clean_orphans(username: str):
+    user = get_user(username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.get("role") not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    projects = _load_projects()
+    valid_ids = {p.get("project_id") for p in projects if p.get("project_id")}
+
+    from app.db import run, run_execute
+    db_project_ids = run("SELECT DISTINCT project_id FROM datasets WHERE project_id IS NOT NULL")
+    cleaned_count = 0
+
+    for row in db_project_ids:
+        pid = row.get("project_id")
+        if pid and pid not in valid_ids:
+            from app.db import run_one
+            count_row = run_one("SELECT count(*) FROM datasets WHERE project_id = ?", [pid])
+            count = count_row[0] if count_row else 0
+            cleaned_count += count
+
+            run_execute("DELETE FROM datasets WHERE project_id = ?", [pid])
+            
+            import shutil
+            project_dir = BASE_DIR / "storage" / "uploads" / "projects" / pid
+            if project_dir.exists():
+                try:
+                    shutil.rmtree(project_dir)
+                except Exception:
+                    pass
+
+    return {
+        "message": "Orphaned datasets cleaned up",
+        "cleaned_count": cleaned_count
+    }

@@ -19,10 +19,10 @@ def delete_dataset(
             detail="User not found"
         )
 
-    if user["role"] != "admin":
+    if user["role"] not in {"superadmin", "admin"}:
         raise HTTPException(
             status_code=403,
-            detail="Only admin can delete datasets"
+            detail="Only admin or superadmin can delete datasets"
         )
 
     success = delete_file(image_id)

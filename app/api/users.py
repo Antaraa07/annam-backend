@@ -4,7 +4,7 @@ from app.services.auth_service import create_user, delete_user, update_role, _lo
 
 router = APIRouter()
 
-VALID_ROLES = {"admin", "researcher", "student", "intern"}
+VALID_ROLES = {"superadmin", "admin", "researcher", "student", "intern"}
 
 
 @router.get("/users")
