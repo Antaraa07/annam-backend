@@ -1,8 +1,11 @@
 import os
 from pathlib import Path
 from typing import BinaryIO
+from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
+
+load_dotenv()
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -78,3 +81,15 @@ def get_s3_object_stream(s3_key: str):
     except ClientError as e:
         print(f"S3 get object stream error: {e}")
         return None
+
+if __name__ == "__main__":
+    from pathlib import Path
+
+    test_file = Path("test.txt")
+
+    success = upload_file_to_s3(
+        test_file,
+        "test/test.txt"
+    )
+
+    print("Upload Success:", success)

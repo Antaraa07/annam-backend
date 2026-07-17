@@ -8,30 +8,8 @@
     "label_classes": [],
     "assigned_users": [
       "researcher1"
-    ]
-  },
-  {
-    "project_id": "a059e45e-6d9d-4a6b-8357-0a16bf1dcd74",
-    "name": "wheat",
-    "description": "wheat crop study",
-    "owner": "antara",
-    "created_at": "2026-06-30T06:34:50Z",
-    "label_classes": [
-      "class1"
     ],
-    "assigned_users": [
-      "student1"
-    ]
-  },
-  {
-    "project_id": "8c4b65c0-d72d-4407-90b0-f909003fcd98",
-    "name": "rice",
-    "description": "rice crop study",
-    "owner": "antara",
-    "created_at": "2026-07-07T12:28:50Z",
-    "label_classes": [
-      "C1"
-    ]
+    "status": "not started"
   },
   {
     "project_id": "31f8e618-5865-42ed-bca9-f4abc4a8194c",
@@ -42,7 +20,8 @@
     "label_classes": [
       "Pest"
     ],
-    "assigned_users": []
+    "assigned_users": [],
+    "status": "not started"
   },
   {
     "project_id": "0fdc5ded-389f-4518-8faa-3430224e2de1",
@@ -55,6 +34,31 @@
     ],
     "assigned_users": [
       "Kanak"
-    ]
+    ],
+    "status": "not started"
+  },
+  {
+    "project_id": "0611b21b-80aa-4b06-ad7a-78b76915667e",
+    "name": "Aphids",
+    "description": "aphids annotation",
+    "owner": "antara",
+    "created_at": "2026-07-17T05:42:59Z",
+    "label_classes": [
+      "Pest"
+    ],
+    "assigned_users": [],
+    "status": "completed"
+  },
+  {
+    "project_id": "a64b25b3-e834-4e04-bc60-6343f951f93c",
+    "name": "Cutworm",
+    "description": "Cutworm annotation",
+    "owner": "antara",
+    "created_at": "2026-07-17T06:37:31Z",
+    "label_classes": [
+      "Pest"
+    ],
+    "assigned_users": [],
+    "status": "ongoing"
   }
 ]

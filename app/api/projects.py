@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -242,6 +242,7 @@ def project_stats(project_id: str, username: str):
 
     from app.db import run, run_one
     from app.api.datasets import _row_to_dataset
+    import re
 
     total_count_row = run_one("SELECT count(*) FROM datasets WHERE project_id = ?", [project_id])
     total_images = total_count_row[0] if total_count_row else 0
@@ -249,9 +250,37 @@ def project_stats(project_id: str, username: str):
     recent_rows = run("SELECT * FROM datasets WHERE project_id = ? ORDER BY uploaded_at DESC LIMIT 50", [project_id])
     recent_uploads = [_row_to_dataset(r) for r in recent_rows]
 
+    # Calculate label counts across all files in the project
+    label_rows = run("SELECT label, filename FROM datasets WHERE project_id = ?", [project_id])
+    label_classes = project.get("label_classes", [])
+    label_counts = {}
+
+    for r in label_rows:
+        lbl = r.get("label")
+        filename = r.get("filename")
+        if lbl:
+            resolved = lbl
+        else:
+            resolved = "Unlabelled"
+            if filename:
+                name_lower = filename.lower()
+                for lc in label_classes:
+                    if lc.lower() in name_lower:
+                        resolved = lc
+                        break
+                if resolved == "Unlabelled":
+                    parts = re.split(r'[_\-\s.]', filename)
+                    first_word = parts[0] if parts else ""
+                    if first_word and not first_word.isdigit():
+                        resolved = first_word
+
+        resolved_cap = resolved.capitalize() if resolved else "Unlabelled"
+        label_counts[resolved_cap] = label_counts.get(resolved_cap, 0) + 1
+
     return {
         "total_images": total_images,
         "recent_uploads": recent_uploads,
+        "label_counts": label_counts,
     }
 
 
@@ -335,7 +364,12 @@ async def bulk_upload(
 
 
 @router.get("/projects/{project_id}/images")
-def get_project_images(project_id: str, username: str):
+def get_project_images(
+    project_id: str,
+    username: str,
+    page: Optional[int] = Query(None),
+    limit: Optional[int] = Query(None),
+):
     user = get_user(username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -353,7 +387,14 @@ def get_project_images(project_id: str, username: str):
     from app.db import run
     from app.api.datasets import _row_to_dataset
 
-    rows = run("SELECT * FROM datasets WHERE project_id = ? ORDER BY uploaded_at DESC", [project_id])
+    if page is not None and limit is not None:
+        offset = (page - 1) * limit
+        rows = run(
+            "SELECT * FROM datasets WHERE project_id = ? ORDER BY uploaded_at DESC LIMIT ? OFFSET ?",
+            [project_id, limit, offset]
+        )
+    else:
+        rows = run("SELECT * FROM datasets WHERE project_id = ? ORDER BY uploaded_at DESC", [project_id])
     return [_row_to_dataset(r) for r in rows]
 
 
