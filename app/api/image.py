@@ -11,12 +11,19 @@ UPLOAD_DIR = Path("storage/uploads")
 @router.get("/image/{filename}")
 def get_image(filename: str):
     from app.db import run_one
-    row = run_one("SELECT path FROM datasets WHERE filename = ? LIMIT 1", [filename])
+    from app.services.s3_service import get_bucket_name, get_project_bucket_name
+    row = run_one("SELECT path, project_id FROM datasets WHERE filename = ? LIMIT 1", [filename])
     if row:
-        path_str = row[0]
+        path_str, project_id = row[0], row[1]
         if path_str.startswith("s3://"):
             key = "/".join(path_str.split("/")[3:])
-            stream = get_s3_object_stream(key)
+            bucket_name = get_project_bucket_name() if project_id else get_bucket_name()
+            stream = get_s3_object_stream(key, bucket=bucket_name)
+            if not stream:
+                # Fallback to the bucket in the URI
+                uri_bucket = path_str.split("/")[2]
+                if uri_bucket != bucket_name:
+                    stream = get_s3_object_stream(key, bucket=uri_bucket)
             if stream:
                 media_type = "image/jpeg"
                 if filename.lower().endswith(".png"):

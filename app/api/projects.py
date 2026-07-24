@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 import io
 import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Query
@@ -53,6 +54,41 @@ def _require_admin(user: Optional[Dict[str, Any]]):
         raise HTTPException(status_code=404, detail="User not found")
     if user.get("role") not in {"admin", "superadmin"}:
         raise HTTPException(status_code=403, detail="Permission denied")
+
+
+def _resolve_category(label: Optional[str], filename: Optional[str], label_classes: List[str]) -> str:
+    """Resolve a human-readable category for a file.
+
+    Priority:
+    1. An explicit `label` value already stored/provided (e.g. from an annotation file).
+    2. A match between the project's label_classes and the filename.
+    3. If the project has exactly one label class, use it directly (covers the common
+       case of a project dedicated to a single category, e.g. Cutworm -> "Pest").
+    4. The first "word" of the filename, if it isn't purely numeric.
+    5. "Unlabelled" as a last resort.
+
+    This is the single source of truth for category resolution so that stored data
+    (via bulk_upload) and computed stats (via project_stats) never disagree.
+    """
+    if label:
+        return str(label).capitalize()
+
+    if filename:
+        name_lower = filename.lower()
+        for lc in label_classes:
+            if lc.lower() in name_lower:
+                return lc.capitalize()
+
+    if len(label_classes) == 1:
+        return label_classes[0].capitalize()
+
+    if filename:
+        parts = re.split(r'[_\-\s.]', filename)
+        first_word = parts[0] if parts else ""
+        if first_word and not first_word.isdigit():
+            return first_word.capitalize()
+
+    return "Unlabelled"
 
 
 class ProjectOut(BaseModel):
@@ -242,7 +278,6 @@ def project_stats(project_id: str, username: str):
 
     from app.db import run, run_one
     from app.api.datasets import _row_to_dataset
-    import re
 
     total_count_row = run_one("SELECT count(*) FROM datasets WHERE project_id = ?", [project_id])
     total_images = total_count_row[0] if total_count_row else 0
@@ -256,25 +291,7 @@ def project_stats(project_id: str, username: str):
     label_counts = {}
 
     for r in label_rows:
-        lbl = r.get("label")
-        filename = r.get("filename")
-        if lbl:
-            resolved = lbl
-        else:
-            resolved = "Unlabelled"
-            if filename:
-                name_lower = filename.lower()
-                for lc in label_classes:
-                    if lc.lower() in name_lower:
-                        resolved = lc
-                        break
-                if resolved == "Unlabelled":
-                    parts = re.split(r'[_\-\s.]', filename)
-                    first_word = parts[0] if parts else ""
-                    if first_word and not first_word.isdigit():
-                        resolved = first_word
-
-        resolved_cap = resolved.capitalize() if resolved else "Unlabelled"
+        resolved_cap = _resolve_category(r.get("label"), r.get("filename"), label_classes)
         label_counts[resolved_cap] = label_counts.get(resolved_cap, 0) + 1
 
     return {
@@ -292,6 +309,27 @@ async def bulk_upload(
     username: str = Form(...),
     csv_file: Optional[UploadFile] = File(None),
 ):
+    """
+    Project bulk upload (annotated data).
+
+    Mirrors the raw-upload flow in upload_service.py.save_file(): every
+    uploaded image gets one row in the `datasets` table, with `path` stored
+    as "s3://<bucket>/<key>" so project_stats(), get_project_images(), and
+    bulk_download() keep working unmodified.
+
+    The only differences from the raw upload:
+      - The actual S3 upload (image + LabelMe JSON) is done by
+        save_annotation_file() in annotation_service.py, which writes to
+          <ProjectDataset>/<Version>/images/<uuid>.jpg
+          <ProjectDataset>/<Version>/annotations/<uuid>.json
+        bulk_upload() takes the image_key it returns and builds the same
+        "s3://bucket/key" path string that save_file() builds.
+      - Images and their LabelMe JSON are paired by basename
+        (e.g. "abc.jpg" <-> "abc.json"), same convention as upload.py.
+      - The annotation's json_key is stored inside metadata_json (no new
+        column, no schema change) so it can be recovered later for
+        extraction/download.
+    """
     user = get_user(username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -306,60 +344,123 @@ async def bulk_upload(
     if not is_admin and not is_assigned:
         raise HTTPException(status_code=403, detail="Not authorized to upload to this project")
 
-    import shutil
-    from app.services.s3_service import is_s3_enabled, upload_file_to_s3, get_bucket_name
+    from app.services.annotation_service import save_annotation_file
+    from app.services.s3_service import get_project_bucket_name
     from app.db import run_execute
 
-    project_dir = BASE_DIR / "storage" / "uploads" / "projects" / project_id
-    project_dir.mkdir(parents=True, exist_ok=True)
-
-    uploaded_filenames: List[str] = []
+    label_classes = project.get("label_classes", [])
     timestamp = _now_iso()
+    version = "1.0"  # project model has no version field today; revisit if/when one is added
+    dataset_name = project.get("name", "Project")
+    bucket_name = get_project_bucket_name()
+
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+    # Separate images from JSON annotations, matched by basename
+    # e.g. "abc.jpg" pairs with "abc.json"
+    images_by_stem: Dict[str, UploadFile] = {}
+    annotations_by_stem: Dict[str, Dict[str, Any]] = {}
 
     for f in files:
-        safe_filename = Path(f.filename).name
-        file_path = project_dir / safe_filename
+        stem = Path(f.filename).stem
+        suffix = Path(f.filename).suffix.lower()
 
-        # Save locally first
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+        if suffix == ".json":
+            raw = await f.read()
+            try:
+                annotations_by_stem[stem] = json.loads(raw)
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid JSON annotation file: {f.filename}",
+                )
+        elif suffix in IMAGE_EXTS:
+            images_by_stem[stem] = f
+        # anything else (e.g. a stray csv) is ignored here
 
-        stored_path = str(file_path)
-        if is_s3_enabled():
-            s3_key = f"uploads/projects/{project_id}/{safe_filename}"
-            if upload_file_to_s3(file_path, s3_key):
-                stored_path = f"s3://{get_bucket_name()}/{s3_key}"
-                try:
-                    file_path.unlink()
-                except Exception:
-                    pass
+    if not images_by_stem:
+        raise HTTPException(status_code=400, detail="No image files found in upload")
+
+    uploaded_filenames: List[str] = []
+    results: List[Dict[str, Any]] = []
+
+    for stem, image_file in images_by_stem.items():
+        safe_filename = Path(image_file.filename).name
+        annotation_json = annotations_by_stem.get(stem)
+
+        resolved_department = _resolve_category(label, safe_filename, label_classes)
+
+        metadata = {
+            "project_id": project_id,
+            "project_name": project.get("name", "Project"),
+            "dataset_name": dataset_name,
+            "owner": username,
+            "label": label,
+            "department": resolved_department,
+            "version": version,
+            "uploaded_at": timestamp,
+        }
+
+        if annotation_json is None:
+            print(f"WARNING: No matching annotation JSON for {safe_filename}, uploading image only")
+
+        result = save_annotation_file(
+            image_file=image_file,
+            annotation_json=annotation_json,
+            metadata=metadata,
+        )
+        # result = {"filename": ..., "image_key": ..., "json_key": ... or None}
 
         image_id = str(uuid.uuid4())
+        stored_path = f"s3://{bucket_name}/{result['image_key']}"
+
+        # Preserve everything passed into save_annotation_file() (not just
+        # the S3 keys), same as save_file()'s "known columns vs. extra"
+        # split, so metadata_json carries the full picture, not a subset.
+        extra = {
+            **metadata,
+            "image_key": result.get("image_key"),
+            "json_key": result.get("json_key"),
+        }
 
         run_execute(
             """
             INSERT INTO datasets
-                (image_id, filename, path, dataset_name, owner, department, version, project_id, label, metadata_json)
+                (
+                    image_id,
+                    filename,
+                    path,
+                    dataset_name,
+                    owner,
+                    department,
+                    version,
+                    project_id,
+                    label,
+                    metadata_json
+                )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 image_id,
                 safe_filename,
                 stored_path,
-                f"{project.get('name', 'Project')} - {timestamp}",
+                dataset_name,
                 username,
-                "General",
-                "1.0",
+                resolved_department,
+                version,
                 project_id,
-                None,
-                "{}",
-            ]
+                label,
+                json.dumps(extra),
+            ],
         )
+
+        results.append(result)
         uploaded_filenames.append(safe_filename)
 
     return {
         "uploaded_count": len(uploaded_filenames),
         "files": uploaded_filenames,
+        "results": results,
     }
 
 
@@ -415,7 +516,7 @@ def bulk_download(project_id: str, username: str):
         raise HTTPException(status_code=403, detail="Not authorized to download this project data")
 
     from app.db import run
-    rows = run("SELECT path, filename FROM datasets WHERE project_id = ?", [project_id])
+    rows = run("SELECT path, filename, metadata_json FROM datasets WHERE project_id = ?", [project_id])
     if not rows:
         raise HTTPException(status_code=404, detail="No files found for this project")
 
@@ -424,20 +525,59 @@ def bulk_download(project_id: str, username: str):
         for r in rows:
             path_str = r["path"]
             filename = r["filename"]
-            content = None
+            metadata_json = r.get("metadata_json")
+
+            # 1. Fetch and write image
+            image_content = None
             if path_str.startswith("s3://"):
-                from app.services.s3_service import get_s3_object_stream
+                from app.services.s3_service import get_s3_object_stream, get_project_bucket_name
                 key = "/".join(path_str.split("/")[3:])
-                stream = get_s3_object_stream(key)
+                bucket_name = get_project_bucket_name()
+                stream = get_s3_object_stream(key, bucket=bucket_name)
+                if not stream:
+                    # Fallback to the bucket in the URI
+                    uri_bucket = path_str.split("/")[2]
+                    if uri_bucket != bucket_name:
+                        stream = get_s3_object_stream(key, bucket=uri_bucket)
                 if stream:
-                    content = stream.read()
+                    image_content = stream.read()
             else:
                 local_path = Path(path_str)
                 if local_path.exists():
                     with open(local_path, "rb") as lf:
-                        content = lf.read()
-            if content:
-                zip_file.writestr(filename, content)
+                        image_content = lf.read()
+
+            if image_content:
+                zip_file.writestr(f"images/{filename}", image_content)
+
+            # 2. Fetch and write JSON annotation
+            if metadata_json:
+                try:
+                    meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+                    json_key = meta.get("json_key")
+                    if json_key:
+                        json_filename = Path(json_key).name
+                        json_content = None
+                        if path_str.startswith("s3://"):
+                            from app.services.s3_service import get_s3_object_stream, get_project_bucket_name
+                            bucket_name = get_project_bucket_name()
+                            stream = get_s3_object_stream(json_key, bucket=bucket_name)
+                            if not stream:
+                                uri_bucket = path_str.split("/")[2]
+                                if uri_bucket != bucket_name:
+                                    stream = get_s3_object_stream(json_key, bucket=uri_bucket)
+                            if stream:
+                                json_content = stream.read()
+                        else:
+                            local_json_path = Path(path_str).parent.parent / "annotations" / f"{Path(path_str).stem}.json"
+                            if local_json_path.exists():
+                                with open(local_json_path, "rb") as lf:
+                                    json_content = lf.read()
+
+                        if json_content:
+                            zip_file.writestr(f"annotations/{json_filename}", json_content)
+                except Exception as e:
+                    print(f"Error zipping json for {filename}: {e}")
 
     zip_buffer.seek(0)
     return StreamingResponse(

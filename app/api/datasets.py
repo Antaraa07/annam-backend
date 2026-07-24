@@ -88,6 +88,7 @@ class DownloadRequest(BaseModel):
     search:     Optional[str]       = None
     project_id: Optional[str]       = None
     source:     Optional[str]       = None  # "raw" | "annotated"
+    dataset_name: Optional[str]     = None
 
 
 @router.post("/datasets/download/structured")
@@ -101,7 +102,13 @@ def download_structured(req: DownloadRequest):
     # ── 1. Build parameterised WHERE clause ──────────────────────────────────
     conditions, params = [], []
 
-    effective_owner = req.owner or req.username
+    effective_owner = req.owner
+    if not effective_owner and req.username:
+        from app.services.auth_service import get_user
+        user = get_user(req.username)
+        if not (user and user.get("role") in ["admin", "superadmin"]):
+            effective_owner = req.username
+
     if effective_owner:
         conditions.append("owner = ?")
         params.append(effective_owner)
@@ -121,10 +128,13 @@ def download_structured(req: DownloadRequest):
     if req.search:
         conditions.append("(LOWER(dataset_name) LIKE ? OR LOWER(filename) LIKE ?)")
         params.extend([f"%{req.search.lower()}%", f"%{req.search.lower()}%"])
+    if req.dataset_name:
+        conditions.append("dataset_name = ?")
+        params.append(req.dataset_name)
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     rows = run(
-        f"SELECT image_id, filename, dataset_name, owner, department, label, "
+        f"SELECT image_id, filename, path, dataset_name, owner, department, label, "
         f"version, project_id, uploaded_at, metadata_json "
         f"FROM datasets {where} ORDER BY uploaded_at DESC",
         params,
@@ -141,14 +151,42 @@ def download_structured(req: DownloadRequest):
 
         # 2a. Images in labelled subfolders
         if "zip" in req.formats:
-            for row in rows:
-                file_path = UPLOAD_DIR / row["filename"]
-                if not file_path.exists():
-                    continue
-                folder = str(row.get(group_col) or "unlabelled").strip() or "unlabelled"
-                # sanitise folder name
-                folder = "".join(c if c.isalnum() or c in " _-" else "_" for c in folder)
-                zf.write(file_path, f"{folder}/{row['filename']}")
+            from concurrent.futures import ThreadPoolExecutor
+            from app.services.s3_service import get_s3_client, get_s3_object_stream, get_bucket_name, get_project_bucket_name
+
+            # Pre-initialize S3 client in the main thread to ensure thread-safety
+            get_s3_client()
+
+            def fetch_content(row):
+                path_str = row["path"]
+                content = None
+                if path_str.startswith("s3://"):
+                    key = "/".join(path_str.split("/")[3:])
+                    bucket_name = get_project_bucket_name() if row.get("project_id") else get_bucket_name()
+                    stream = get_s3_object_stream(key, bucket=bucket_name)
+                    if not stream:
+                        # Fallback to the bucket in the URI
+                        uri_bucket = path_str.split("/")[2]
+                        if uri_bucket != bucket_name:
+                            stream = get_s3_object_stream(key, bucket=uri_bucket)
+                    if stream:
+                        content = stream.read()
+                else:
+                    file_path = Path(path_str)
+                    if file_path.exists():
+                        with open(file_path, "rb") as lf:
+                            content = lf.read()
+                return row, content
+
+            with ThreadPoolExecutor(max_workers=15) as executor:
+                results = list(executor.map(fetch_content, rows))
+
+            for row, content in results:
+                if content:
+                    folder = str(row.get(group_col) or "unlabelled").strip() or "unlabelled"
+                    # sanitise folder name
+                    folder = "".join(c if c.isalnum() or c in " _-" else "_" for c in folder)
+                    zf.writestr(f"imgs/{folder}/{row['filename']}", content)
 
         # 2b. labels.csv
         if "csv" in req.formats:

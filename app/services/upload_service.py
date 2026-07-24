@@ -163,8 +163,10 @@ def delete_file(image_id: str):
     path_str = row[0]
 
     if path_str.startswith("s3://"):
-        key = "/".join(path_str.split("/")[3:])
-        delete_file_from_s3(key)
+        parts = path_str.split("/")
+        bucket_name = parts[2]
+        key = "/".join(parts[3:])
+        delete_file_from_s3(key, bucket=bucket_name)
     else:
         file_path = Path(path_str)
         if file_path.exists():
